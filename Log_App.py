@@ -1,22 +1,28 @@
 # app.py
 """
-Qforia-region Streamlit app (Gemini) — simplified UI.
-- Single UI field for Gemini API Key (no project/location/model inputs).
-- Robust call_gemini_text() that tries multiple client call shapes.
+Qforia-region (Gemini) - REST-first implementation that accepts a Gemini/Generative API key.
+- Enter a Gemini API key in the UI. If provided, the app calls the public Generative Language REST endpoint.
+- If no API key is provided, the app attempts to use the installed google.generativeai client as a fallback.
+- Passage→query matching uses substring + difflib similarity fallback (no embeddings required).
 Notes:
- - Install: pip install streamlit pandas numpy google-generativeai
- - Provide API key in the UI or set GOOGLE_API_KEY env var.
- - Change MODEL_NAME constant if your account uses a different model identifier.
+ - Install: pip install streamlit pandas requests
+ - Run: streamlit run app.py
+ - Change MODEL_NAME to a model your key can access if necessary.
 """
 
-import os, re, json, time
+import os
+import json
+import re
+import time
 from typing import List, Dict, Any, Optional
+import difflib
 
+import requests
 import streamlit as st
 import pandas as pd
 import numpy as np
 
-# Attempt to import google.generativeai
+# Try optional google.generativeai import as a fallback
 try:
     import google.generativeai as genai
     GENAI_AVAILABLE = True
@@ -24,8 +30,9 @@ except Exception:
     genai = None
     GENAI_AVAILABLE = False
 
-# -------------------- Config --------------------
-MODEL_NAME = os.getenv("GEMINI_MODEL", "models/text-bison-001")  # change if needed
+# ---------------- Config (change MODEL_NAME if your account requires)
+MODEL_NAME = os.getenv("GEMINI_MODEL", "text-bison-001")  # typical public model name; change if needed
+GENERATIVE_REST_BASE = "https://generativelanguage.googleapis.com/v1beta2/models"
 DEFAULT_NUM_QUERIES = 30
 AVAILABLE_SURFACES = ["AI Overview", "AI Mode"]
 
@@ -39,7 +46,7 @@ REGIONS = [
     {"name": "France", "code": "FR", "language": "fr-FR"},
 ]
 
-# -------------------- Helpers --------------------
+# ---------------- Helpers ----------------
 def make_prompt(seed_query: str, surface: str, region: Dict[str,str], num_queries: int, extra_instructions: str="") -> str:
     ts = pd.Timestamp.utcnow().isoformat() + "Z"
     region_hint = f"{region.get('name')} (country_code={region.get('code')}, language={region.get('language')})"
@@ -71,7 +78,7 @@ Produce the JSON now.
 """
     return prompt.strip()
 
-def extract_json_array(text: str):
+def extract_json_array(text: str) -> Optional[List[Dict[str,Any]]]:
     try:
         return json.loads(text)
     except Exception:
@@ -83,165 +90,156 @@ def extract_json_array(text: str):
                 return None
     return None
 
-# -------------------- Gemini (Vertex AI) resilient calls --------------------
-def configure_genai(api_key: Optional[str] = None):
-    """Configure google.generativeai client with an API key or rely on ADC otherwise."""
-    if not GENAI_AVAILABLE:
-        raise RuntimeError("google.generativeai package not installed. pip install google-generativeai")
-    explicit_key = api_key or os.getenv("GOOGLE_API_KEY")
-    if explicit_key:
-        try:
-            genai.configure(api_key=explicit_key)
-        except Exception:
-            # some client versions use a different configure signature; try a fallback
-            try:
-                genai.configure(project=None, location=None, api_key=explicit_key)
-            except Exception as e:
-                raise RuntimeError(f"genai.configure failed: {e}")
-    else:
-        # rely on ADC environment (GOOGLE_APPLICATION_CREDENTIALS)
-        # no explicit configure call required in many setups
-        pass
+# ---------------- REST-based call (API key path) ----------------
+def call_generative_rest(prompt: str, api_key: str, model: str = MODEL_NAME, temperature: float = 0.0, max_output_tokens: int = 512) -> str:
+    """
+    Call the Generative Language REST endpoint using an API key.
+    Endpoint: https://generativelanguage.googleapis.com/v1beta2/models/{model}:generateText?key=API_KEY
+    Body shape: {"prompt": {"text": prompt}, "temperature": ..., "maxOutputTokens": ...}
+    Response parsing is best-effort: many versions place text in 'candidates'[0]['output'] or similar.
+    """
+    url = f"{GENERATIVE_REST_BASE}/{model}:generateText"
+    params = {"key": api_key}
+    payload = {
+        "prompt": {"text": prompt},
+        "temperature": temperature,
+        "maxOutputTokens": int(max_output_tokens),
+    }
+    headers = {"Content-Type": "application/json"}
+    resp = requests.post(url, params=params, json=payload, headers=headers, timeout=60)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Generative REST error {resp.status_code}: {resp.text}")
+    data = resp.json()
+    # Try common shapes
+    # 1) data.get('candidates')[0].get('output')
+    if isinstance(data, dict):
+        if "candidates" in data and isinstance(data["candidates"], list) and data["candidates"]:
+            cand = data["candidates"][0]
+            # candidate might have 'output' or 'content' or 'text'
+            for k in ("output","content","text","displayText"):
+                if isinstance(cand, dict) and k in cand and isinstance(cand[k], str):
+                    return cand[k]
+        # 2) data.get('output') or data.get('response')
+        for k in ("output","response","result"):
+            if k in data and isinstance(data[k], str):
+                return data[k]
+    # fallback: return whole body as text for debugging
+    return json.dumps(data, indent=2)
 
-def call_gemini_text(prompt: str, model: str = MODEL_NAME, temperature: float = 0.0, max_output_tokens: int = 512) -> str:
+# ---------------- Fallback SDK call (if no API key) ----------------
+def call_genai_sdk(prompt: str, model: str = MODEL_NAME, temperature: float = 0.0, max_output_tokens: int = 512) -> str:
     """
-    Try multiple client interfaces in order to get the model text.
-    Returns the raw text (best-effort).
+    Best-effort usage of installed google.generativeai client.
+    This may need adaptation per client version. The app will show raw output if parsing fails.
     """
     if not GENAI_AVAILABLE:
-        raise RuntimeError("google.generativeai not installed.")
-    # Try chat.create
+        raise RuntimeError("google.generativeai client not installed.")
+    # try chat.create
     try:
         if hasattr(genai, "chat") and hasattr(genai.chat, "create"):
-            resp = genai.chat.create(model=model, messages=[{"role":"user","content":prompt}], temperature=temperature, max_output_tokens=max_output_tokens)
-            # attempt to extract candidate text
-            # Several client shapes exist; try common attributes
-            if hasattr(resp, "candidates") and resp.candidates:
-                candidate = resp.candidates[0]
-                # candidate may have 'content' or 'message' fields
-                content = getattr(candidate, "content", None) or getattr(candidate, "message", None) or str(candidate)
-                return content if isinstance(content, str) else str(content)
-            if hasattr(resp, "output"):
-                return str(resp.output)
-            # fallback
-            return str(resp)
+            r = genai.chat.create(model=model, messages=[{"role":"user","content":prompt}], temperature=temperature, max_output_tokens=max_output_tokens)
+            # try common attributes
+            if hasattr(r, "candidates") and r.candidates:
+                c = r.candidates[0]
+                return getattr(c, "content", getattr(c, "message", str(c)))
+            if hasattr(r, "output"):
+                return getattr(r, "output")
+            return str(r)
     except Exception:
-        # continue to other attempts
         pass
-
-    # Try generate_text
+    # try generate_text
     try:
         if hasattr(genai, "generate_text"):
-            resp = genai.generate_text(model=model, prompt=prompt, temperature=temperature, max_output_tokens=max_output_tokens)
-            # Common shapes: dict with 'candidates', or object with .text
-            if isinstance(resp, dict) and "candidates" in resp and resp["candidates"]:
-                return resp["candidates"][0].get("output", "") or resp["candidates"][0].get("content","")
-            if hasattr(resp, "text"):
-                return getattr(resp, "text")
-            return str(resp)
+            r = genai.generate_text(model=model, prompt=prompt, temperature=temperature, max_output_tokens=max_output_tokens)
+            if isinstance(r, dict) and "candidates" in r and r["candidates"]:
+                return r["candidates"][0].get("output") or r["candidates"][0].get("content","")
+            if hasattr(r, "text"):
+                return getattr(r, "text")
+            return str(r)
     except Exception:
         pass
+    # last fallback: stringified object
+    raise RuntimeError("Installed google.generativeai client does not expose a supported method in this code path.")
 
-    # Try genai.text.generate (another newer interface)
-    try:
-        if hasattr(genai, "text") and hasattr(genai.text, "generate"):
-            resp = genai.text.generate(model=model, input=prompt, temperature=temperature, max_output_tokens=max_output_tokens)
-            # example shapes: resp.text or resp.output or resp.candidates
-            if hasattr(resp, "text"):
-                return getattr(resp, "text")
-            if hasattr(resp, "output"):
-                return str(resp.output)
-            return str(resp)
-    except Exception:
-        pass
-
-    # Last-resort: call generic attribute or raise informative error
-    raise RuntimeError("google.generativeai SDK present but no supported generation method found on this client. Inspect your client version and adapt the call shape.")
-
-def gemini_embeddings(texts: List[str], model: Optional[str] = None) -> List[List[float]]:
-    """Compute embeddings via genai client (best-effort across versions)."""
-    if not GENAI_AVAILABLE:
-        raise RuntimeError("google.generativeai not installed.")
-    emb_model = model or "embedding-gecko-001"
-    # Try genai.embeddings.create
-    try:
-        if hasattr(genai, "embeddings") and hasattr(genai.embeddings, "create"):
-            resp = genai.embeddings.create(model=emb_model, input=texts)
-            out = []
-            for item in resp.data:
-                out.append(item.embedding)
-            return out
-    except Exception:
-        pass
-    # Try genai.get_embeddings / genai.getEmbedding
-    try:
-        if hasattr(genai, "get_embeddings"):
-            resp = genai.get_embeddings(model=emb_model, input=texts)
-            return resp.get("embeddings") or resp.get("data")
-    except Exception:
-        pass
-    raise RuntimeError("Embeddings not available via installed google.generativeai client. Check SDK docs and available embedding models.")
-
-# -------------------- Utilities --------------------
-def cosine_sim(a: List[float], b: List[float]) -> float:
-    a = np.array(a, dtype=float)
-    b = np.array(b, dtype=float)
-    if np.linalg.norm(a) == 0 or np.linalg.norm(b) == 0:
+# ---------------- Simple passage->query similarity (no embeddings) ----------------
+def similarity_score(a: str, b: str) -> float:
+    """Combine substring check and difflib ratio for robust matching (0..1)."""
+    if not a or not b:
         return 0.0
-    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+    a_low = a.lower()
+    b_low = b.lower()
+    if a_low in b_low or b_low in a_low:
+        return 1.0
+    # difflib ratio
+    return difflib.SequenceMatcher(None, a_low, b_low).ratio()
 
-# -------------------- Streamlit UI --------------------
-st.set_page_config(page_title="Qforia-region (Gemini)", layout="wide")
-st.title("Qforia-region — Query Fan-Out Simulator (Gemini)")
+# ---------------- Streamlit UI ----------------
+st.set_page_config(page_title="Qforia-region (Gemini REST)", layout="wide")
+st.title("Qforia-region — Query Fan-Out Simulator (Gemini REST)")
 
 with st.sidebar:
     st.header("Configuration")
-    st.write("Authentication: provide a Gemini API Key (or set GOOGLE_API_KEY env var).")
-    api_key_box = st.text_input("Gemini API Key (optional)", type="password")
+    st.write("Provide a Gemini / Generative API Key (or set GOOGLE_API_KEY env var).")
+    api_key = st.text_input("Gemini API Key (optional)", type="password")
     st.markdown("---")
-    st.number_of_queries = st.number_input("Number of synthetic queries (default)", min_value=5, max_value=200, value=DEFAULT_NUM_QUERIES)
-    st.caption("Note: model name is taken from code constant MODEL_NAME. Change in the file if needed.")
+    st.caption("The app will use the API key path (REST) when you enter a key; otherwise it attempts the installed SDK. Use a key for the simplest flow.")
 
-# Main form (compact)
-seed_query = st.text_input("Seed query", value="how to do call forwarding")
-region_choice = st.selectbox("Region", [r["name"] for r in REGIONS], index=0)
-region = next((r for r in REGIONS if r["name"] == region_choice), REGIONS[0])
-num_queries = st.number_input("Number of synthetic queries", min_value=5, max_value=200, value=DEFAULT_NUM_QUERIES)
-surface = st.selectbox("Target surface", AVAILABLE_SURFACES)
-run_btn = st.button("Run Fan-Out 🚀")
+col1, col2 = st.columns([3,1])
+with col1:
+    seed_query = st.text_input("Seed query", value="how to do call forwarding")
+    region_choice = st.selectbox("Region", [r["name"] for r in REGIONS], index=0)
+    region = next((r for r in REGIONS if r["name"] == region_choice), REGIONS[0])
+    num_queries = st.number_input("Number of synthetic queries", min_value=5, max_value=200, value=DEFAULT_NUM_QUERIES)
+    surface = st.selectbox("Target surface", AVAILABLE_SURFACES)
+    extra_instructions = st.text_area("Extra prompt instructions (optional)", value="")
+    run_btn = st.button("Run Fan-Out 🚀")
+with col2:
+    st.write("Export / Actions")
+    export_csv = st.button("Export last results to CSV")
+    export_json = st.button("Export last results to JSON")
 
-# session state
 if "last_df" not in st.session_state:
     st.session_state["last_df"] = pd.DataFrame()
-if "embeddings" not in st.session_state:
-    st.session_state["embeddings"] = []
+if "raw_last" not in st.session_state:
+    st.session_state["raw_last"] = ""
 
 if run_btn and seed_query.strip():
-    try:
-        configure_genai(api_key=api_key_box if api_key_box else None)
-    except Exception as e:
-        st.error(f"genai.configure error: {e}")
-        raise
+    prompt = make_prompt(seed_query, surface, region, int(num_queries), extra_instructions)
+    raw_output = None
+    # Prefer API key + REST if api_key provided
+    if api_key:
+        try:
+            raw_output = call_generative_rest(prompt, api_key=api_key, model=MODEL_NAME, temperature=0.0, max_output_tokens=1024)
+        except Exception as e:
+            st.error(f"Generative REST call failed: {e}")
+            raw_output = None
+    else:
+        # Try SDK fallback
+        if GENAI_AVAILABLE:
+            try:
+                # Configure SDK to use ADC if needed; genai.configure(api_key=...) could be used if key available
+                raw_output = call_genai_sdk(prompt, model=MODEL_NAME, temperature=0.0, max_output_tokens=1024)
+            except Exception as e:
+                st.error(f"SDK call failed: {e}")
+                raw_output = None
+        else:
+            st.error("No API key provided and google.generativeai is not installed. Provide a Gemini API key to use REST path.")
+            raw_output = None
 
-    prompt = make_prompt(seed_query, surface, region, int(num_queries), "")
-    try:
-        with st.spinner("Calling Gemini..."):
-            raw = call_gemini_text(prompt, model=MODEL_NAME, temperature=0.0, max_output_tokens=1024)
-    except Exception as e:
-        st.error(f"Gemini call/config error: {e}")
-        raw = None
+    st.session_state["raw_last"] = raw_output or ""
 
-    if raw:
-        parsed = extract_json_array(raw)
+    parsed = None
+    if raw_output:
+        parsed = extract_json_array(raw_output)
         if parsed is None:
-            st.error("Could not parse JSON from Gemini output. Showing raw output for debugging (first 2000 chars):")
-            st.code(raw[:2000])
+            st.error("Could not parse JSON from model output. Showing raw output (truncated):")
+            st.code((raw_output or "")[:4000])
         else:
             rows = []
             for i, item in enumerate(parsed):
                 rows.append({
                     "rank": i+1,
-                    "query": item.get("query",""),
+                    "query": item.get("query","").strip(),
                     "intent": item.get("intent","informational"),
                     "entity": item.get("entity",""),
                     "variation_type": item.get("variation_type",""),
@@ -250,41 +248,28 @@ if run_btn and seed_query.strip():
             df = pd.DataFrame(rows)
             st.session_state["last_df"] = df
 
-            # compute embeddings if possible
-            try:
-                texts = df["query"].tolist()
-                emb = gemini_embeddings(texts)
-                st.session_state["embeddings"] = emb
-                st.success(f"Generated {len(df)} queries and computed embeddings.")
-            except Exception as e:
-                st.warning(f"Query generation succeeded but embeddings failed or are unavailable: {e}")
-                st.session_state["embeddings"] = []
-
+# Display results if present
 if not st.session_state["last_df"].empty:
     df = st.session_state["last_df"]
     st.subheader("Synthetic Queries")
     st.dataframe(df)
 
-    st.markdown("---")
-    st.subheader("Passage -> Query (embeddings)")
-    passage = st.text_area("Paste page passage (optional)")
-    match_btn = st.button("Match passage to generated queries")
+    if export_csv:
+        st.download_button("Download CSV", data=df.to_csv(index=False).encode("utf-8"), file_name="qforia_region_export.csv", mime="text/csv")
+    if export_json:
+        st.download_button("Download JSON", data=df.to_json(orient="records", force_ascii=False), file_name="qforia_region_export.json", mime="application/json")
 
+    st.markdown("---")
+    st.subheader("Passage → Query mapping (no embeddings)")
+    passage = st.text_area("Paste page passage/paragraph (optional)")
+    match_btn = st.button("Find top matching generated queries")
     if match_btn and passage.strip():
-        if not st.session_state["embeddings"]:
-            st.error("No embeddings available. Re-run and ensure embedding-capable model is available.")
-        else:
-            try:
-                p_emb = gemini_embeddings([passage])[0]
-                scores = []
-                for i, q_emb in enumerate(st.session_state["embeddings"]):
-                    sim = cosine_sim(p_emb, q_emb)
-                    scores.append((df.iloc[i]["query"], sim, df.iloc[i]["intent"], df.iloc[i]["rationale"]))
-                scores_sorted = sorted(scores, key=lambda x: x[1], reverse=True)
-                out = [{"query": s[0], "score": round(s[1],4), "intent": s[2], "rationale": s[3]} for s in scores_sorted[:20]]
-                st.table(pd.DataFrame(out))
-            except Exception as e:
-                st.error(f"Embeddings matching failed: {e}")
+        scores = []
+        for idx, row in df.iterrows():
+            score = similarity_score(row["query"], passage)
+            scores.append((row["query"], round(score,4), row["intent"], row["rationale"]))
+        scores_sorted = sorted(scores, key=lambda x: x[1], reverse=True)
+        st.table(pd.DataFrame([{"query": s[0], "score": s[1], "intent": s[2], "rationale": s[3]} for s in scores_sorted[:20]]))
 
 st.markdown("---")
-st.caption("This app accepts a Gemini API key. If your client version differs, adapt the call_gemini_text() branches. Region hints bias outputs but do not reproduce Google internal fan-outs.")
+st.caption("This app uses a REST-first approach when you provide a Gemini API key. If you prefer full SDK ADC/service-account flows or embeddings, I can add those next. Region hints bias outputs but do not guarantee alignment with live query logs.")
