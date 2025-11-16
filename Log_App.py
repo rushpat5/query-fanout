@@ -1,10 +1,9 @@
 # app.py
 """
 Qforia-region Streamlit app with Google Gemini (Vertex AI) example.
-- Uses the google-generativeai client if available.
-- Replace PROJECT_ID / LOCATION / MODEL_NAME with your values.
-- Set GOOGLE_API_KEY OR use ADC via GOOGLE_APPLICATION_CREDENTIALS to a service account JSON.
-Notes: confirm the client API and model names against Google Cloud docs for your account/region.
+Fixes previous global-scope bug by avoiding 'global' inside handlers.
+Replace PROJECT_ID / LOCATION / MODEL_NAME with your values or fill via UI.
+Ensure credentials set via GOOGLE_APPLICATION_CREDENTIALS or GOOGLE_API_KEY.
 """
 
 import os
@@ -25,11 +24,10 @@ except Exception:
     genai = None
     GENAI_AVAILABLE = False
 
-# -------------------- CONFIG (replace placeholders) --------------------
-PROJECT_ID = os.getenv("GCP_PROJECT_ID", "your-gcp-project-id")
-LOCATION = os.getenv("GCP_LOCATION", "us-central1")   # e.g., us-central1, europe-west4
-MODEL_NAME = os.getenv("GEMINI_MODEL", "models/text-bison-001")  # replace with your model resource name if needed
-# You can set GOOGLE_API_KEY or use GOOGLE_APPLICATION_CREDENTIALS (ADC) for authentication.
+# -------------------- Default CONFIG (change if you want file defaults) --------------------
+DEFAULT_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "your-gcp-project-id")
+DEFAULT_LOCATION = os.getenv("GCP_LOCATION", "us-central1")
+DEFAULT_MODEL_NAME = os.getenv("GEMINI_MODEL", "models/text-bison-001")
 # ----------------------------------------------------------------------
 
 DEFAULT_NUM_QUERIES = 30
@@ -90,68 +88,56 @@ def extract_json_array(text: str):
     return None
 
 # -------------------- Gemini (Vertex AI) calls --------------------
-def configure_genai(api_key: Optional[str] = None):
+def configure_genai(api_key: Optional[str] = None, project: Optional[str] = None, location: Optional[str] = None):
     """Configure google.generativeai client (if available). Accepts API key or relies on ADC."""
     if not GENAI_AVAILABLE:
         raise RuntimeError("google.generativeai package not installed. pip install google-generativeai")
-    # If you have an explicit API key:
     explicit_key = api_key or os.getenv("GOOGLE_API_KEY")
     if explicit_key:
         genai.configure(api_key=explicit_key)
     else:
-        # Rely on ADC (Application Default Credentials)
-        # No explicit configuration required if ADC is set via GOOGLE_APPLICATION_CREDENTIALS
-        # But set project & location for convenience
-        genai.configure(project=PROJECT_ID, location=LOCATION)
+        # Rely on ADC; set project/location for convenience if provided
+        cfg = {}
+        if project:
+            cfg["project"] = project
+        if location:
+            cfg["location"] = location
+        if cfg:
+            genai.configure(**cfg)
 
-def call_gemini_text(prompt: str, model: str = None, temperature: float = 0.0, max_output_tokens: int = 512) -> str:
+def call_gemini_text(prompt: str, model: str, temperature: float = 0.0, max_output_tokens: int = 512) -> str:
     """
     Call a text generation endpoint on Vertex AI (Gemini / Bison family) via google.generativeai.
     Returns the raw text produced by the model.
-    NOTE: Validate model identifier and SDK usage against your installed google-generativeai version.
     """
     if not GENAI_AVAILABLE:
-        raise RuntimeError("google.generativeai not available. Install google-generativeai and configure credentials.")
-    model_to_use = model or MODEL_NAME
-    # Example using genai.client
-    # The actual call shape depends on SDK version; this is a commonly used pattern:
+        raise RuntimeError("google.generativeai not available. pip install google-generativeai")
+    model_to_use = model
     try:
-        # Use genai.generate_text or genai.chat.create depending on client version
         if hasattr(genai, "generate_text"):
             resp = genai.generate_text(model=model_to_use, prompt=prompt, max_output_tokens=max_output_tokens, temperature=temperature)
-            # Many client versions store text at resp.text or resp["candidates"][0]["output"]
+            # Try multiple response shapes
             if isinstance(resp, dict) and "candidates" in resp and resp["candidates"]:
-                return resp["candidates"][0].get("output", "")
-            # fallback
-            return getattr(resp, "text", "") or ""
+                return resp["candidates"][0].get("output", "") or resp["candidates"][0].get("content", "")
+            return getattr(resp, "text", "") or str(resp)
         elif hasattr(genai, "chat"):
-            # genai.chat.create is another common interface
             chat_resp = genai.chat.create(model=model_to_use, messages=[{"role":"user","content":prompt}], temperature=temperature, max_output_tokens=max_output_tokens)
-            # find content
-            # different SDKs provide different shapes
             if hasattr(chat_resp, "candidates") and chat_resp.candidates:
-                return chat_resp.candidates[0].content
-            # try messages
-            if hasattr(chat_resp, "output"):
-                return chat_resp.output
-            return str(chat_resp)
+                return getattr(chat_resp.candidates[0], "content", "") or str(chat_resp.candidates[0])
+            return getattr(chat_resp, "output", "") or str(chat_resp)
         else:
-            # Last resort: try a generic method
             resp = genai.create(model=model_to_use, prompt=prompt)
             return str(resp)
     except Exception as e:
-        # surface the error for debugging in the UI
         raise
 
-# Embeddings via Vertex AI: some SDKs expose embeddings via genai.get_embeddings / genai.embeddings
 def gemini_embeddings(texts: List[str], model: Optional[str] = None) -> List[List[float]]:
-    """Compute embeddings via the same client. Implementation depends on sdk version."""
+    """Compute embeddings via google.generativeai client; model name is SDK-dependent."""
     if not GENAI_AVAILABLE:
         raise RuntimeError("google.generativeai not installed.")
-    emb_model = model or "embedding-gecko-001"  # placeholder; pick available embedding model in your project
+    emb_model = model or "embedding-gecko-001"
     if hasattr(genai, "embeddings") and hasattr(genai.embeddings, "create"):
         resp = genai.embeddings.create(model=emb_model, input=texts)
-        # resp.data[*].embedding typical
         out = []
         for item in resp.data:
             out.append(item.embedding)
@@ -164,12 +150,11 @@ def gemini_embeddings(texts: List[str], model: Optional[str] = None) -> List[Lis
 
 # -------------------- Utilities --------------------
 def cosine_sim(a: List[float], b: List[float]) -> float:
-    import numpy as _np
-    a = _np.array(a, dtype=float)
-    b = _np.array(b, dtype=float)
-    if _np.linalg.norm(a) == 0 or _np.linalg.norm(b) == 0:
+    a = np.array(a, dtype=float)
+    b = np.array(b, dtype=float)
+    if np.linalg.norm(a) == 0 or np.linalg.norm(b) == 0:
         return 0.0
-    return float(_np.dot(a, b) / (_np.linalg.norm(a) * _np.linalg.norm(b)))
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
 # -------------------- Streamlit UI --------------------
 st.set_page_config(page_title="Qforia-region (Gemini)", layout="wide")
@@ -177,11 +162,11 @@ st.title("Qforia-region — Query Fan-Out Simulator (Gemini)")
 
 with st.sidebar:
     st.header("Configuration")
-    st.write("Authentication: Set GOOGLE_APPLICATION_CREDENTIALS env var to a service-account JSON, or set GOOGLE_API_KEY.")
+    st.write("Authentication: set GOOGLE_APPLICATION_CREDENTIALS or GOOGLE_API_KEY.")
     api_key_box = st.text_input("Google API Key (optional)", type="password")
-    project_box = st.text_input("Project ID", value=PROJECT_ID)
-    location_box = st.text_input("Location", value=LOCATION)
-    model_box = st.text_input("Model resource name", value=MODEL_NAME)
+    project_box = st.text_input("Project ID", value=DEFAULT_PROJECT_ID)
+    location_box = st.text_input("Location", value=DEFAULT_LOCATION)
+    model_box = st.text_input("Model resource name", value=DEFAULT_MODEL_NAME)
     num_queries = st.number_input("Number of synthetic queries", min_value=5, max_value=200, value=DEFAULT_NUM_QUERIES)
     surface = st.radio("Search Mode", AVAILABLE_SURFACES)
 
@@ -207,24 +192,23 @@ with col2:
     export_csv = st.button("Export last results to CSV")
     export_json = st.button("Export last results to JSON")
 
+# session state
 if "last_df" not in st.session_state:
     st.session_state["last_df"] = pd.DataFrame()
 if "embeddings" not in st.session_state:
     st.session_state["embeddings"] = []
 
 if run_btn and seed_query.strip():
-    # configure client
-    try:
-        configure_genai(api_key_box if api_key_box else None)
-        # update globals from UI
-        global PROJECT_ID, LOCATION, MODEL_NAME
-        PROJECT_ID = project_box or PROJECT_ID
-        LOCATION = location_box or LOCATION
-        MODEL_NAME = model_box or MODEL_NAME
+    # Use local variables instead of modifying module globals
+    ui_project = project_box or DEFAULT_PROJECT_ID
+    ui_location = location_box or DEFAULT_LOCATION
+    ui_model = model_box or DEFAULT_MODEL_NAME
 
+    try:
+        configure_genai(api_key=api_key_box if api_key_box else None, project=ui_project, location=ui_location)
         prompt = make_prompt(seed_query, surface, region, int(num_queries), extra_instructions)
         with st.spinner("Calling Gemini..."):
-            raw = call_gemini_text(prompt, model=MODEL_NAME, temperature=0.0, max_output_tokens=1024)
+            raw = call_gemini_text(prompt, model=ui_model, temperature=0.0, max_output_tokens=1024)
     except Exception as e:
         st.error(f"Gemini call/config error: {e}")
         raw = None
@@ -249,14 +233,14 @@ if run_btn and seed_query.strip():
             df = pd.DataFrame(rows)
             st.session_state["last_df"] = df
 
-            # embeddings (best-effort)
+            # attempt embeddings
             try:
                 texts = df["query"].tolist()
                 emb = gemini_embeddings(texts)
                 st.session_state["embeddings"] = emb
                 st.success(f"Generated {len(df)} queries and computed embeddings (Gemini).")
             except Exception as e:
-                st.warning(f"Query generation succeeded but embeddings failed or not available via SDK: {e}")
+                st.warning(f"Query generation succeeded but embeddings failed or are unavailable via SDK: {e}")
                 st.session_state["embeddings"] = []
 
 if not st.session_state["last_df"].empty:
@@ -284,7 +268,7 @@ if not st.session_state["last_df"].empty:
 
     if match_btn and passage.strip():
         if not st.session_state["embeddings"]:
-            st.error("No embeddings available; re-run generation and ensure embedding-capable model and client are configured.")
+            st.error("No embeddings available; re-run generation and ensure embedding-capable model / SDK configured.")
         else:
             try:
                 pass_emb = gemini_embeddings([passage])[0]
