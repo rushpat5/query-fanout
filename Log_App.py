@@ -1,62 +1,46 @@
-# app.py
 import streamlit as st
 import pandas as pd
 import requests
 import json
 import re
 
-# -----------------------------------
-# Configuration
-# -----------------------------------
-DEFAULT_MODEL = "models/text-bison-001"
-DEFAULT_NUM = 30
-
-GENERATIVE_BASES = [
-    "https://generativelanguage.googleapis.com/v1",
-    "https://generativelanguage.googleapis.com/v1beta2",
+# -----------------------------------------------------
+# Correct AND supported Gemini REST endpoint
+# -----------------------------------------------------
+GEMINI_ENDPOINTS = [
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent",
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent",
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.0-pro:generateContent",
 ]
 
-MODEL_PROBES = [
-    "models/gemini-1.5-pro",
-    "models/gemini-1.5",
-    "models/gemini-1.0",
-    "models/text-bison-001",
-    "models/chat-bison-001",
-]
 
-# -----------------------------------
-# Prompt builder
-# -----------------------------------
-def make_prompt(seed, region, n, extra=""):
-    ts = pd.Timestamp.utcnow().isoformat() + "Z"
+def build_prompt(seed, region, n, extra):
     return f"""
-You are an assistant that MUST OUTPUT valid JSON only: a JSON array of exactly {n} objects.
+You are an assistant generating synthetic user queries. Output ONLY valid JSON.
+Return an array of {n} objects.
 
-Each object must have:
+Each object MUST have:
 - query
-- intent (informational|commercial|transactional|navigational|investigational)
+- intent
 - entity
-- variation_type (paraphrase|narrowing|expansion|entity-focus|question-form|long-tail|comparative)
-- rationale (one sentence)
+- variation_type
+- rationale
 
 Seed query: "{seed}"
 Region: "{region}"
-Timestamp: {ts}
 
-Extra instructions:
+Extra rules:
 {extra}
 
-Output ONLY the JSON array. Nothing else.
+Output ONLY a JSON array. No explanation, no markdown.
 """.strip()
 
-# -----------------------------------
-# JSON extraction
-# -----------------------------------
-def extract_json_array(text):
+
+def extract_json_array(txt):
     try:
-        return json.loads(text)
+        return json.loads(txt)
     except:
-        m = re.search(r"\[\s*\{.*\}\s*\]", text, re.DOTALL)
+        m = re.search(r"\[[\s\S]*\]", txt)
         if m:
             try:
                 return json.loads(m.group(0))
@@ -64,82 +48,77 @@ def extract_json_array(text):
                 return None
     return None
 
-# -----------------------------------
-# REST generator
-# -----------------------------------
-def generate_via_rest(prompt, api_key, model):
+
+def call_gemini_rest(prompt, api_key):
     attempts = []
 
-    model_list = [model] if model else MODEL_PROBES
-
-    for base in GENERATIVE_BASES:
-        for m in model_list:
-
-            url = f"{base}/{m}:generateText"
-
-            payload = {
-                "prompt": {"text": prompt},
-                "maxOutputTokens": 1200,
-                "temperature": 0.0
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt}
+                ]
             }
+        ]
+    }
 
-            try:
-                r = requests.post(
-                    url,
-                    params={"key": api_key},
-                    json=payload,
-                    timeout=30
-                )
-                attempts.append({
-                    "url": url,
-                    "status": r.status_code,
-                    "body": r.text[:600]
-                })
+    for url in GEMINI_ENDPOINTS:
+        try:
+            r = requests.post(
+                url,
+                params={"key": api_key},
+                json=payload,
+                timeout=40
+            )
 
-                if r.status_code == 200:
-                    data = r.json()
+            attempts.append({
+                "url": url,
+                "status": r.status_code,
+                "body": r.text[:600]
+            })
 
-                    # direct candidate structure
-                    if isinstance(data, dict):
-                        if "candidates" in data and data["candidates"]:
-                            cand = data["candidates"][0]
-                            for k in ("output","content","text","displayText"):
-                                if isinstance(cand.get(k), str):
-                                    return True, cand[k], attempts
+            if r.status_code == 200:
+                data = r.json()
 
-                        # fallback to any known top-level fields
-                        for k in ("output","text","content","result","response"):
-                            if k in data and isinstance(data[k], str):
-                                return True, data[k], attempts
-
-                    # fallback raw
+                # Gemini outputs text inside candidates[0].content.parts[*].text
+                try:
+                    parts = data["candidates"][0]["content"]["parts"]
+                    all_text = "".join(p.get("text", "") for p in parts)
+                    return True, all_text, attempts
+                except:
                     return True, r.text, attempts
 
-            except Exception as e:
-                attempts.append({"url": url, "status": None, "body": repr(e)})
+        except Exception as e:
+            attempts.append({"url": url, "status": None, "body": repr(e)})
 
     return False, None, attempts
 
-# -----------------------------------
-# UI
-# -----------------------------------
-st.set_page_config(layout="wide", page_title="Qforia REST-only")
 
-st.title("Qforia — REST-only Gemini Fan-Out")
+# -----------------------------------------------------
+# Streamlit UI
+# -----------------------------------------------------
+st.set_page_config(layout="wide", page_title="Qforia (Gemini REST)")
+
+st.title("Qforia — High-Fidelity Query Fan-Out (Gemini REST API)")
 
 with st.sidebar:
-    st.header("Auth & Model")
-    api_key = st.text_input("Gemini API Key (required)", type="password")
-    model_resource = st.text_input("Model resource (optional)", value=DEFAULT_MODEL)
-    st.caption("REST does not depend on google-generativeai client.")
+    st.header("Authentication")
+    api_key = st.text_input("Gemini API Key", type="password")
 
 seed = st.text_input("Seed query", "how to do call forwarding")
-region = st.selectbox("Region", ["United States","United Kingdom","India","Canada","Australia"], index=0)
-num = st.number_input("Number of queries", min_value=3, max_value=200, value=DEFAULT_NUM)
-extra = st.text_area("Extra prompt instructions")
 
-run = st.button("Run Fan-Out (REST)")
+region = st.selectbox("Region", [
+    "United States",
+    "United Kingdom",
+    "India",
+    "Canada",
+    "Australia",
+])
 
+n = st.number_input("Number of synthetic queries", 5, 200, 30)
+extra = st.text_area("Extra instructions (optional)", "")
+
+run = st.button("Run Fan-Out")
 
 if "df" not in st.session_state:
     st.session_state.df = pd.DataFrame()
@@ -148,69 +127,64 @@ if "raw" not in st.session_state:
 if "attempts" not in st.session_state:
     st.session_state.attempts = []
 
+
 if run:
     if not api_key:
         st.error("API key required.")
     else:
-        prompt = make_prompt(seed, region, int(num), extra)
+        prompt = build_prompt(seed, region, n, extra)
 
-        ok, raw, attempts = generate_via_rest(
-            prompt,
-            api_key.strip(),
-            model_resource.strip() if model_resource else None
-        )
+        ok, raw, attempts = call_gemini_rest(prompt, api_key)
 
         st.session_state.attempts = attempts
 
         if not ok:
-            st.error("REST generation failed. See attempts below.")
-            st.dataframe(pd.DataFrame(attempts))
+            st.error("REST generation failed. See attempts.")
         else:
-            st.success("REST generation succeeded.")
+            st.success("Gemini generation completed.")
             st.session_state.raw = raw
 
             parsed = extract_json_array(raw)
             if parsed is None:
-                st.warning("Could not parse JSON. Raw output:")
+                st.warning("Could not parse JSON.")
                 st.code(raw[:4000])
             else:
-                rows=[]
+                rows = []
                 for i, item in enumerate(parsed):
                     rows.append({
                         "rank": i+1,
-                        "query": item.get("query",""),
-                        "intent": item.get("intent",""),
-                        "entity": item.get("entity",""),
-                        "variation_type": item.get("variation_type",""),
-                        "rationale": item.get("rationale",""),
+                        "query": item.get("query", ""),
+                        "intent": item.get("intent", ""),
+                        "entity": item.get("entity", ""),
+                        "variation_type": item.get("variation_type", ""),
+                        "rationale": item.get("rationale", ""),
                     })
                 st.session_state.df = pd.DataFrame(rows)
 
-# results
+
 if not st.session_state.df.empty:
-    st.subheader("Synthetic Queries")
+    st.subheader("Generated Queries")
     st.dataframe(st.session_state.df)
 
     st.download_button(
         "Download CSV",
         st.session_state.df.to_csv(index=False).encode("utf-8"),
-        file_name="qforia_rest.csv",
+        file_name="qforia_gemini.csv",
         mime="text/csv"
     )
 
     st.download_button(
         "Download JSON",
-        st.session_state.df.to_json(orient="records", force_ascii=False),
-        file_name="qforia_rest.json",
+        st.session_state.df.to_json(orient="records"),
+        file_name="qforia_gemini.json",
         mime="application/json"
     )
 
+
 if st.session_state.raw:
-    st.markdown("---")
     st.subheader("Raw Output (truncated)")
-    st.code(st.session_state.raw[:4000])
+    st.code(st.session_state.raw[:3000])
 
 if st.session_state.attempts:
-    st.markdown("---")
-    st.subheader("REST Attempts")
+    st.subheader("Attempt Log")
     st.dataframe(pd.DataFrame(st.session_state.attempts))
