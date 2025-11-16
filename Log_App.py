@@ -1,141 +1,130 @@
 import streamlit as st
-import pandas as pd
 import requests
 import json
-import re
 
-# ---------- Configuration ----------
-FLASH_MODEL = "models/gemini-2.5-flash"
-ENDPOINT = f"https://generativelanguage.googleapis.com/v1beta/models/{FLASH_MODEL}:generateContent"
+# -----------------------------
+# Constants
+# -----------------------------
+FLASH_MODEL = "gemini-2.0-flash"
+BASE_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{FLASH_MODEL}:generateContent"
 
-def build_prompt(seed, region, n, extra=""):
-    ts = pd.Timestamp.utcnow().isoformat() + "Z"
-    return f"""
-You are an assistant that MUST OUTPUT valid JSON only: a JSON array of exactly {n} objects.
 
-Each object MUST have:
-- query
-- intent (informational|commercial|transactional|navigational|investigational)
-- entity
-- variation_type (paraphrase|narrowing|expansion|entity-focus|question-form|long-tail|comparative)
-- rationale
+# -----------------------------
+# REST CALL FUNCTION
+# -----------------------------
+def call_gemini_flash(api_key: str, prompt: str):
+    headers = {
+        "Content-Type": "application/json"
+    }
 
-Seed query: "{seed}"
-Region: "{region}"
-Timestamp: {ts}
-
-Extra instructions:
-{extra}
-
-Output ONLY the JSON array. Nothing else.
-""".strip()
-
-def extract_json_array(text):
-    try:
-        return json.loads(text)
-    except:
-        m = re.search(r"\[[\s\S]*\]", text)
-        if m:
-            try:
-                return json.loads(m.group(0))
-            except:
-                return None
-    return None
-
-def call_flash_model(prompt, api_key):
     payload = {
         "contents": [
-            {"parts":[{"text": prompt}]}
+            {
+                "parts": [
+                    {"text": prompt}
+                ]
+            }
         ]
     }
+
     try:
-        r = requests.post(
-            ENDPOINT,
+        response = requests.post(
+            BASE_URL,
             params={"key": api_key},
+            headers=headers,
             json=payload,
             timeout=40
         )
+        return response.status_code, response.text
+
     except Exception as e:
-        return False, None, [{"url": ENDPOINT, "status": None, "body": repr(e)}]
+        return -1, str(e)
 
-    attempt = {"url": ENDPOINT, "status": r.status_code, "body": r.text[:600]}
-    if r.status_code == 200:
-        try:
-            data = r.json()
-            parts = data["candidates"][0]["content"]["parts"]
-            text = "".join(p.get("text","") for p in parts)
-            return True, text, [attempt]
-        except:
-            return True, r.text, [attempt]
-    else:
-        return False, None, [attempt]
 
-# ---------- Streamlit UI ----------
-st.set_page_config(layout="wide", page_title="Qforia Flash-Only")
-st.title("Qforia — Free-Tier Flash Model Fan-Out")
+# -----------------------------
+# STREAMLIT UI
+# -----------------------------
+st.title("Qforia-Free — Query Fan-Out Simulator (Flash Model Only)")
 
-with st.sidebar:
-    st.header("Authentication")
-    api_key = st.text_input("Gemini API Key (free tier)", type="password")
+st.subheader("Authentication")
+api_key = st.text_input("Gemini API Key (free-tier)", type="password")
 
-seed = st.text_input("Seed query", "how to do call forwarding")
-region = st.selectbox("Region", ["United States","United Kingdom","India","Canada","Australia"], index=0)
-n = st.number_input("Number of synthetic queries", min_value=3, max_value=200, value=30)
-extra = st.text_area("Extra instructions (optional)", "")
+st.subheader("Fan-out Settings")
+seed_query = st.text_input("Seed Query", "how to do call forwarding")
+region = st.selectbox("Region (bias via prompt only)", [
+    "United States", "United Kingdom", "Canada", "India",
+    "Australia", "Singapore", "Germany", "Brazil", "Global"
+])
+num = st.number_input("Number of synthetic queries", min_value=5, max_value=200, value=30)
 
-run = st.button("Run Fan-Out (flash model)")
+extra_instr = st.text_area("Extra instructions (optional)", "")
 
-if "df" not in st.session_state:
-    st.session_state.df = pd.DataFrame()
-if "raw" not in st.session_state:
-    st.session_state.raw = ""
-if "attempts" not in st.session_state:
-    st.session_state.attempts = []
+run = st.button("Run Fan-Out (Flash Model)")
 
+
+# -----------------------------
+# RUN FAN OUT
+# -----------------------------
 if run:
-    if not api_key:
+    if not api_key.strip():
         st.error("API key required.")
     else:
-        prompt = build_prompt(seed, region, n, extra)
-        ok, raw, attempts = call_flash_model(prompt, api_key.strip())
-        st.session_state.attempts = attempts
+        st.info("Generating via free-tier flash model...")
 
-        if not ok:
-            st.error("Flash-model REST call failed.")
+        # Prompt engineering for "region bias"
+        fanout_prompt = f"""
+You are generating synthetic search queries for SEO evaluation.
+
+Seed query:
+{seed_query}
+
+Region:
+{region}
+
+Number of synthetic queries:
+{num}
+
+Instructions:
+- Output EXACTLY a JSON list (array) of strings.
+- No explanation, no prose.
+- Each query must reflect REALISTIC user intent patterns for the region.
+- Avoid duplicates.
+- Avoid unnatural rewrites.
+- Preserve plausible search traffic behavior.
+- Additional instructions (if any): {extra_instr}
+        """
+
+        status, body = call_gemini_flash(api_key, fanout_prompt)
+
+        st.subheader("Raw Response")
+        st.code(body)
+
+        if status != 200:
+            st.error(f"Flash-model REST call failed. Status: {status}")
         else:
-            st.success("Flash model generation succeeded.")
-            st.session_state.raw = raw
-            parsed = extract_json_array(raw)
-            if parsed is None:
-                st.warning("Could not parse JSON. Raw output:")
-                st.code(raw[:4000])
-            else:
-                rows = []
-                for i, item in enumerate(parsed):
-                    rows.append({
-                        "rank": i+1,
-                        "query": item.get("query",""),
-                        "intent": item.get("intent",""),
-                        "entity": item.get("entity",""),
-                        "variation_type": item.get("variation_type",""),
-                        "rationale": item.get("rationale",""),
-                    })
-                st.session_state.df = pd.DataFrame(rows)
+            try:
+                parsed = json.loads(body)["candidates"][0]["content"]["parts"][0]["text"]
+                final_json = json.loads(parsed)
+                st.success("Parsed synthetic queries:")
+                st.write(final_json)
 
-if not st.session_state.df.empty:
-    st.subheader("Synthetic Queries")
-    st.dataframe(st.session_state.df)
-    st.download_button("Download CSV",
-                       st.session_state.df.to_csv(index=False).encode("utf-8"),
-                       file_name="qforia_flash.csv", mime="text/csv")
-    st.download_button("Download JSON",
-                       st.session_state.df.to_json(orient="records", force_ascii=False),
-                       file_name="qforia_flash.json", mime="application/json")
+                # Export options
+                st.download_button("Download JSON", data=json.dumps(final_json, indent=2), file_name="fanout.json")
 
-if st.session_state.raw:
-    st.subheader("Raw Output (truncated)")
-    st.code(st.session_state.raw[:3000])
+            except Exception:
+                st.warning("Model response could not be parsed as JSON. Showing raw output above.")
 
-if st.session_state.attempts:
-    st.subheader("REST Attempt Log")
-    st.dataframe(pd.DataFrame(st.session_state.attempts))
+
+# -----------------------------
+# Notes
+# -----------------------------
+st.markdown("""
+---
+
+### Notes
+- This tool uses **free-tier Gemini Flash only**.
+- Accuracy is lower than Qforia’s original PRO model.
+- Region effects are prompt-based only (no proprietary signals).
+- No embeddings, no Vertex, no client-library reflection, no deprecated endpoints.
+
+""")
