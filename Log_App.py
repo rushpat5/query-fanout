@@ -1,9 +1,9 @@
 # app.py
 """
-Streamlit app: Qforia-client-style (Gemini) — uses google.generativeai client library.
-- Enter your Gemini API key (UI).
-- Enter a model resource (recommended) or use the default.
-- The app uses the client library (preferred) rather than raw REST calls.
+Qforia-client-style fixed: Streamlit app using google.generativeai client.
+- Fixes uninitialized variable bug in client_generate_text.
+- Minimal UI: Gemini API key and model resource are required.
+- Shows raw output when parsing fails for debugging.
 """
 
 import os
@@ -14,7 +14,7 @@ from typing import Optional, List, Dict, Any
 import streamlit as st
 import pandas as pd
 
-# Attempt import of the official client library
+# Attempt to import the official client library
 try:
     import google.generativeai as genai  # type: ignore
     GENAI_AVAILABLE = True
@@ -23,7 +23,7 @@ except Exception:
     GENAI_AVAILABLE = False
 
 # ----------------- Configuration -----------------
-DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "models/text-bison-001")  # change to a model you know
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "models/text-bison-001")
 DEFAULT_NUM = 30
 
 # ----------------- Helpers -----------------
@@ -54,7 +54,6 @@ def extract_json_array(text: str) -> Optional[List[Dict[str,Any]]]:
     try:
         return json.loads(text)
     except Exception:
-        # attempt to find the first JSON array in the text
         m = re.search(r"\[\s*\{.*\}\s*\]", text, re.DOTALL)
         if m:
             try:
@@ -71,27 +70,30 @@ def client_generate_text(prompt: str, model: str, max_tokens: int = 1024, temper
     if not GENAI_AVAILABLE:
         raise RuntimeError("google.generativeai client not installed. Run: pip install google-generativeai")
 
-    # Prefer genai.generate_text if available
+    last_exc = None  # initialize to avoid unbound local reference
+
+    # 1) Try genai.generate_text
     try:
         if hasattr(genai, "generate_text"):
             resp = genai.generate_text(model=model, prompt=prompt, max_output_tokens=max_tokens, temperature=temperature)
-            # resp may be an object or dict
+            # dict shape with candidates
             if isinstance(resp, dict) and "candidates" in resp and resp["candidates"]:
                 cand = resp["candidates"][0]
-                return cand.get("output") or cand.get("content") or str(cand)
+                if isinstance(cand, dict):
+                    return cand.get("output") or cand.get("content") or json.dumps(cand)
+                return str(cand)
             # object with .text
             if hasattr(resp, "text"):
                 return getattr(resp, "text")
-            # fallback to str
             return str(resp)
     except Exception as e:
-        # continue to next shape, but keep last exception for debugging
         last_exc = e
 
-    # Try genai.chat.create if exists
+    # 2) Try genai.chat.create
     try:
         if hasattr(genai, "chat") and hasattr(genai.chat, "create"):
             chat_resp = genai.chat.create(model=model, messages=[{"role":"user","content":prompt}], temperature=temperature, max_output_tokens=max_tokens)
+            # many client shapes provide candidates list
             if hasattr(chat_resp, "candidates") and chat_resp.candidates:
                 cand = chat_resp.candidates[0]
                 return getattr(cand, "content", getattr(cand, "message", str(cand)))
@@ -101,7 +103,7 @@ def client_generate_text(prompt: str, model: str, max_tokens: int = 1024, temper
     except Exception as e:
         last_exc = e
 
-    # Try genai.text.generate (another interface)
+    # 3) Try genai.text.generate
     try:
         if hasattr(genai, "text") and hasattr(genai.text, "generate"):
             resp = genai.text.generate(model=model, input=prompt, temperature=temperature, max_output_tokens=max_tokens)
@@ -111,11 +113,17 @@ def client_generate_text(prompt: str, model: str, max_tokens: int = 1024, temper
     except Exception as e:
         last_exc = e
 
-    # If we reached here, raise a clear error with last exception info
-    raise RuntimeError(f"Client present but no supported generation method succeeded. Last error: {repr(last_exc)}")
+    # No supported method returned a value; raise informative error
+    if last_exc is not None:
+        raise RuntimeError(f"Client present but generation methods failed. Last error: {repr(last_exc)}")
+    else:
+        raise RuntimeError(
+            "google.generativeai client present but no supported generation method was found on this client. "
+            "Checked generate_text, chat.create, and text.generate. Inspect your installed package version."
+        )
 
 # ----------------- Streamlit UI -----------------
-st.set_page_config(page_title="Qforia-client (Gemini)", layout="wide")
+st.set_page_config(page_title="Qforia-client (fixed)", layout="wide")
 st.title("Qforia-client-style — Query Fan-Out (Gemini)")
 
 with st.sidebar:
@@ -154,11 +162,11 @@ if run_btn:
     elif not model_resource or not model_resource.strip():
         st.error("Model resource is required (enter a model name your key can access).")
     else:
-        # configure client with key
+        # configure client
         try:
+            # genai.configure accepts api_key param for many versions
             genai.configure(api_key=api_key.strip())
         except Exception:
-            # some client versions accept genai.configure(api_key=...) directly; if it fails, still continue
             try:
                 genai.configure(project=None, location=None, api_key=api_key.strip())
             except Exception as e:
